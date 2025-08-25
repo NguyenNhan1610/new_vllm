@@ -59,6 +59,9 @@ class RPCError:
     is_engine_errored: bool
     exception: BaseException
 
+@dataclass
+class RPCCustomMessage:
+    payload: dict
 
 @dataclass
 class RPCAbortRequest:

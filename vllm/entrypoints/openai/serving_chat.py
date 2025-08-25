@@ -1517,3 +1517,6 @@ class OpenAIServingChat(OpenAIServing):
             engine_prompt["cache_salt"] = request.cache_salt
 
         return messages, [prompt_token_ids], [engine_prompt]
+
+    def get_metrics(self):
+        return self.engine_client.get_request_metrics()

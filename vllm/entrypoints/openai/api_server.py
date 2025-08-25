@@ -561,6 +561,13 @@ def maybe_register_tokenizer_info_endpoint(args):
                                 status_code=result.error.code if isinstance(
                                     result, ErrorResponse) else 200)
 
+@router.get("/tasks/status")
+async def get_running_tasks(request: Request):
+    """Returns the current number of running tasks."""
+    handle = await chat(request).get_metrics()
+    handle["max_concurrent"] = request.app.state.max_concurrent
+    handle["max_model_len"] = request.app.state.max_model_len
+    return JSONResponse(content=handle)
 
 @router.get("/v1/models")
 async def show_available_models(raw_request: Request):

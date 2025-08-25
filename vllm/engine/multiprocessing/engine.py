@@ -4,6 +4,7 @@
 import pickle
 import signal
 from contextlib import contextmanager
+import time
 from typing import Iterator, List, Optional, Union
 
 import cloudpickle
@@ -27,7 +28,8 @@ from vllm.engine.multiprocessing import (ENGINE_DEAD_ERROR, IPC_DATA_EXT,
                                          RPCResetPrefixCacheRequest,
                                          RPCSleepRequest, RPCStartupRequest,
                                          RPCStartupResponse,
-                                         RPCUProfileRequest, RPCWakeUpRequest)
+                                         RPCUProfileRequest, RPCWakeUpRequest,
+                                         RPCCustomMessage)
 # yapf: enable
 from vllm.logger import init_logger
 from vllm.outputs import RequestOutput
@@ -112,6 +114,9 @@ class MQLLMEngine:
 
         # Error state.
         self._errored_with: Optional[BaseException] = None
+
+        self.last_send_time = 0  # Track last send time
+        self.send_interval = 3  # Send data at most every 3 seconds
 
     @property
     def dead_error(self) -> BaseException:
@@ -217,17 +222,38 @@ class MQLLMEngine:
             socket.send_multipart((identity, pickle.dumps(response)),
                                   copy=False)
 
+    def send_custom_value(self, value: dict, is_timer: bool = True):
+        """Send a custom value to the client, but only if enough time has passed."""
+        if is_timer:
+            current_time = time.time()
+            if current_time - self.last_send_time < self.send_interval:
+                return  # Skip sending if interval hasn't passed
+
+            self.last_send_time = current_time  # Update last send time
+
+        try:
+            message = RPCCustomMessage(payload=value)
+            output_bytes = pickle.dumps(message)  # Serialize the message
+            self.output_socket.send_multipart((output_bytes,), copy=False)
+            # logger.info("Sent custom value to client: %s", value)
+        except Exception as e:
+            logger.error("Error sending custom value: %s", str(e))
+        finally:
+            return
+
     def run_engine_loop(self):
         """Core busy loop of the LLMEngine."""
 
         while True:
             if not self.engine.has_unfinished_requests():
                 # Poll until there is work to do.
+                self.send_custom_value(self.engine.get_cache_metrics(), is_timer=False)
                 while self.input_socket.poll(timeout=POLLING_TIMEOUT_MS) == 0:
                     # When there's no work, check on engine health and send
                     # health status back to client
                     self._health_check()
                     self.engine.do_log_stats()
+                    self.send_custom_value(self.engine.get_cache_metrics(), is_timer=False)
                     logger.debug("Waiting for new requests in engine loop.")
 
             # Handle any input from the client.
@@ -235,6 +261,8 @@ class MQLLMEngine:
 
             # Engine step.
             request_outputs = self.engine_step()
+
+            self.send_custom_value(self.engine.get_cache_metrics(), is_timer=False)
 
             # Send request outputs (if async, done in engine_step callback).
             if not self.use_async_sockets:

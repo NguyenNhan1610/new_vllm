@@ -239,6 +239,9 @@ class LLMEngine:
             self.detokenizer = Detokenizer(self.tokenizer)
             tokenizer_group = self.get_tokenizer_group()
 
+        self.current_running_requests = 0
+        self.total_cancelled_requests = 0
+
         # Ensure that the function doesn't contain a reference to self,
         # to avoid engine GC issues
         def get_tokenizer_for_seq(sequence: Sequence) -> AnyTokenizer:
@@ -793,9 +796,18 @@ class LLMEngine:
             >>> # abort the request
             >>> engine.abort_request(request_id)
         """
+        initial_count = self.get_num_unfinished_requests()
         for scheduler in self.scheduler:
             scheduler.abort_seq_group(
                 request_id, seq_id_to_seq_group=self.seq_id_to_seq_group)
+
+        # Compute how many were actually canceled
+        final_count = self.get_num_unfinished_requests()
+        num_cancelled_requests = initial_count - final_count
+
+        # Update counters
+        self.total_cancelled_requests += num_cancelled_requests
+        self.current_running_requests = final_count  # Recalculate after cancellation
 
     def get_vllm_config(self) -> VllmConfig:
         """Gets the vllm configuration."""
@@ -1051,6 +1063,11 @@ class LLMEngine:
             # Tracing
             self.do_tracing(scheduler_outputs, finished_before)
 
+        self.current_running_requests = sum(
+            scheduler.get_num_unfinished_seq_groups()
+            for scheduler in self.scheduler
+        )
+
         return None
 
     def _advance_to_next_step(
@@ -1291,6 +1308,11 @@ class LLMEngine:
             # queued control plane messages, such as add/remove lora adapters.
             logger.debug("Stopping remote worker execution loop.")
             self.model_executor.stop_remote_worker_execution_loop()
+
+        self.current_running_requests = sum(
+            scheduler.get_num_unfinished_seq_groups()
+            for scheduler in self.scheduler
+        )
 
         return ctx.request_outputs
 

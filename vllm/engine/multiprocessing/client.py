@@ -33,7 +33,8 @@ from vllm.engine.multiprocessing import (ENGINE_DEAD_ERROR, IPC_DATA_EXT,
                                          RPCResetPrefixCacheRequest,
                                          RPCSleepRequest, RPCStartupRequest,
                                          RPCStartupResponse,
-                                         RPCUProfileRequest, RPCWakeUpRequest)
+                                         RPCUProfileRequest, RPCWakeUpRequest,
+                                         RPCCustomMessage)
 from vllm.engine.protocol import EngineClient
 # yapf: enable
 from vllm.envs import VLLM_RPC_TIMEOUT
@@ -136,6 +137,12 @@ class MQLLMEngineClient(EngineClient):
         self.health_loop: Optional[asyncio.Task] = None
         self._engine_process = psutil.Process(engine_pid)
 
+        # A set of request ids that are currently being processed.
+        self.running_request_ids: set[str] = set()
+        
+        # Cache metrics
+        self.cache_metrics: Dict[str, int] = {}
+
     @staticmethod
     def is_unsupported_config(vllm_config: VllmConfig):
         # Pipeline parallel not yet supported
@@ -205,6 +212,11 @@ class MQLLMEngineClient(EngineClient):
                 message: Frame = await self.output_socket.recv(copy=False)
                 request_outputs = pickle.loads(message.buffer)
 
+                if isinstance(request_outputs, RPCCustomMessage):
+                    # logger.debug(f"Received custom message: {request_outputs.payload}")
+                    self.cache_metrics = request_outputs.payload
+                    continue
+
                 is_error = isinstance(request_outputs,
                                       (BaseException, RPCError))
                 if is_error:
@@ -268,6 +280,10 @@ class MQLLMEngineClient(EngineClient):
         queue = self.output_queues.get(request_output.request_id)
         if queue is not None:
             queue.put_nowait(request_output)
+            self.running_request_ids.add(request_output.request_id)
+            
+            if isinstance(request_output, RequestOutput) and request_output.finished:
+                self.running_request_ids.discard(request_output.request_id)
 
     async def setup(self):
         """Setup the client before it starts sending server requests."""
@@ -580,13 +596,19 @@ class MQLLMEngineClient(EngineClient):
                     request_output = await queue.get()
 
                     if isinstance(request_output, BaseException):
+                        self.running_request_ids.discard(request_id)
                         raise request_output
 
                     finished = request_output.finished
+
+                    if finished:
+                        self.running_request_ids.discard(request_id)
+
                     yield request_output
             finally:
                 # Request was canceled by the client.
                 if not finished and not self.errored:
+                    self.running_request_ids.discard(request_id)
                     await self.abort(request_id)
         finally:
             self.output_queues.pop(request_id)
@@ -666,3 +688,26 @@ class MQLLMEngineClient(EngineClient):
         # Raise on error, otherwise happily return None
         if isinstance(request_output, BaseException):
             raise request_output
+
+    async def get_request_metrics(self) -> Dict[str, int]:
+        """Get metrics about running and waiting requests.
+        
+        Returns:
+            Dict[str, int]: A dictionary containing:
+                - total_requests: Total number of active requests (running + waiting)
+                - running_requests: Number of requests currently being processed
+                - waiting_requests: Number of requests in the waiting queue
+        """
+        
+        waiting = self.cache_metrics.get("num_waiting", 0)
+        gpu_cache_usage = self.cache_metrics.get("gpu_cache_usage", 0.0)
+        cpu_cache_usage = self.cache_metrics.get("cpu_cache_usage", 0.0)
+        
+        metrics = {
+            "running_requests": self.cache_metrics.get("num_running", 0),
+            "waiting_requests": waiting,
+            "gpu_cache_usage": gpu_cache_usage,
+            "cpu_cache_usage": cpu_cache_usage
+        }
+        
+        return metrics

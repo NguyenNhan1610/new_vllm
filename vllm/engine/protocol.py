@@ -284,6 +284,11 @@ class EngineClient(ABC):
         ...
 
     @abstractmethod
+    async def get_request_metrics(self) -> Mapping[str, int]:
+        """Get the request metrics"""
+        ...
+
+    @abstractmethod
     async def start_profile(self) -> None:
         """Start profiling the engine"""
         ...
